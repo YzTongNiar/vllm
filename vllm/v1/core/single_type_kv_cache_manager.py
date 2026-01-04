@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
+from vllm.v1.core.multi_block_pool import MultiBlockPool
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
@@ -44,8 +45,10 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
-            self.block_size *= dcp_world_size * pcp_world_size
+        if dcp_world_size > 1:
+            self.block_size *= dcp_world_size
+        if pcp_world_size > 1 and not isinstance(block_pool, MultiBlockPool):
+            self.block_size *= pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
 
@@ -62,12 +65,26 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
-
+    
+    def _padding_num_new_blocks(self, num_new_blocks: int,
+                                pool_ids: list[int] = None) -> int:
+        # Padding num_new_blocks to the nearest multiple of num pools
+        # if block_pool is instance of `MultiBlockPool`.
+        if isinstance(self.block_pool, MultiBlockPool):
+            if pool_ids and len(pool_ids) > 0:
+                num_pools = len(pool_ids)
+            else:
+                num_pools = self.block_pool.num_pools
+            return ((num_new_blocks + num_pools - 1) // num_pools) * num_pools
+        else:
+            return num_new_blocks
+    
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
+        pool_ids: list[int] = None
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -78,7 +95,8 @@ class SingleTypeKVCacheManager(ABC):
                 tokens that are already allocated).
             new_computed_blocks: The new computed blocks just hitting the
                 prefix caching.
-
+            pool_ids: The ids of block pool to allocate new blocks (default
+                is None if not use multi block pool and enable dynamic cp).
         Returns:
             The number of blocks.
         """
@@ -89,6 +107,8 @@ class SingleTypeKVCacheManager(ABC):
             - len(new_computed_blocks)
             - len(self.req_to_blocks[request_id])
         )
+        num_new_blocks = self._padding_num_new_blocks(num_new_blocks,
+                                                      pool_ids)
         # If a computed block of a request is an eviction candidate (in the
         # free queue and ref_cnt == 0), it will be changed from a free block
         # to a computed block when the request is allocated, so we also count
@@ -120,7 +140,9 @@ class SingleTypeKVCacheManager(ABC):
             assert len(new_computed_blocks) == 0
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int
+        self, request_id: str, 
+        num_tokens: int,
+        pool_ids: list[int] = None
     ) -> list[KVCacheBlock]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -130,7 +152,8 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
-
+            pool_ids: The ids of block pool to allocate new blocks (default
+                is None if not use multi block pool and enable dynamic cp).
         Returns:
             The new allocated blocks.
         """
@@ -140,7 +163,14 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            # Padding num_new_blocks if block_pool is multi block pool
+            num_new_blocks = self._padding_num_new_blocks(num_new_blocks,
+                                                          pool_ids)
+            if isinstance(self.block_pool, MultiBlockPool) and pool_ids:
+                new_blocks = self.block_pool.get_new_blocks_by_pool(num_new_blocks,
+                                                                    pool_ids)
+            else:
+                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
             return new_blocks
 
@@ -711,6 +741,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
+        pool_ids: list[int] = None
     ) -> int:
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
@@ -721,11 +752,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 * self.kv_cache_spec.num_speculative_blocks
             )
         return super().get_num_blocks_to_allocate(
-            request_id, num_tokens, new_computed_blocks
+            request_id, num_tokens, new_computed_blocks, pool_ids
         )
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int
+        self, request_id: str, num_tokens: int, pool_ids: list[int] = None
     ) -> list[KVCacheBlock]:
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
@@ -735,7 +766,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.kv_cache_spec.block_size
                 * self.kv_cache_spec.num_speculative_blocks
             )
-        return super().allocate_new_blocks(request_id, num_tokens)
+        return super().allocate_new_blocks(request_id, num_tokens, pool_ids)
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):

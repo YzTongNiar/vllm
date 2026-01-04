@@ -39,6 +39,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.dynamic_bucket_load_balancer import NoStandardBucketLoadBalancer
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
@@ -141,6 +142,26 @@ class Scheduler(SchedulerInterface):
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
 
+        # dynamic pcp
+        self.enable_dynamic_pcp = True
+        self.dynamic_pcp_threshold = [4096]
+        self.dynamic_pcp_policy = (0, 0)
+        self.balancer = None
+        if self.pcp_world_size > 1 and self.enable_dynamic_pcp:
+            self.balancer = NoStandardBucketLoadBalancer(
+                num_buckets=self.pcp_world_size,
+                max_length=self.dynamic_pcp_threshold[0])
+            
+        # Note(hc): The scheduler’s block_size must be multiplied
+        # by dcp_world_size, since block hashes are computed on the
+        # original full token sequence at a granularity of
+        # original_block_size × dcp_world_size.
+        if self.dcp_world_size > 1:
+            self.block_size *= self.dcp_world_size
+
+        if self.pcp_world_size > 1 and not self.enable_dynamic_pcp:
+            self.block_size *= self.pcp_world_size
+
         # req_id -> Request
         self.requests: dict[str, Request] = {}
         # Scheduling policy
@@ -196,7 +217,7 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
-
+        
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -209,6 +230,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            enable_dynamic_pcp=self.enable_dynamic_pcp
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -423,6 +445,10 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        is_first_request = True
+        is_short_request = True
+        dynamic_pcp_size = self.pcp_world_size
+        dynamic_pcp_ranks: dict[str, int] = {}
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -580,6 +606,39 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
+                request.dynamic_pcp_ranks: list[int] = []
+                if self.pcp_world_size > 1 and self.enable_dynamic_pcp:
+                    request_num_new_tokens = request.num_tokens - num_computed_tokens
+                    is_short_request = request_num_new_tokens  < self.dynamic_pcp_threshold[0]
+                    if is_first_request:
+                        if is_short_request:
+                            is_short_batch = True
+                            dynamic_pcp_size = 1
+                        else:
+                            is_short_batch = False
+                    else:
+                        if (is_short_batch and not is_short_request) or (not is_short_batch and is_short_request):
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            # print(f"===== request: {request.request_id}, skip, request_num_new_tokens: {request_num_new_tokens}")
+                            continue
+ 
+                    # BP case
+                    if dynamic_pcp_size == 1:
+                        if is_first_request:
+                            # make sure that rank 0 has request
+                            dynamic_pcp_ranks[request.request_id] = 0
+                        else:
+                            dynamic_pcp_ranks[request.request_id] = self.balancer.dispatch_task_without_id(num_new_tokens)
+                        request.dynamic_pcp_ranks.append(dynamic_pcp_ranks[request.request_id])
+ 
+                    # print(f'>>>>>>>>> is_first_request: {is_first_request}, dynamic_pcp_size::{dynamic_pcp_size}, request_id:: {request.request_id}, '
+                    #       f'num_new_tokens:: {request.num_tokens - num_computed_tokens}, '
+                    #       f'dynamic_pcp_ranks:: {dynamic_pcp_ranks}')
+                    if is_first_request:
+                        is_first_request = False
+                    # print(f'>>>>>>>>> dynamic_cp_size::{dynamic_cp_size}, request_id:: {request.request_id}, num_new_tokens:: {request.num_tokens - num_computed_tokens}, dynamic_cp_ranks:: {dynamic_cp_ranks}')
+                
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -588,10 +647,12 @@ class Scheduler(SchedulerInterface):
                     num_lookahead_tokens=effective_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    pool_ids=request.dynamic_pcp_ranks,
                 )
+                print(f"======= schedule allocate_slots, request.dynamic_pcp_ranks: {request.dynamic_pcp_ranks}")
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
+                    del dynamic_pcp_ranks[request.request_id]
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -656,6 +717,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+        if self.pcp_world_size > 1 and self.enable_dynamic_pcp:
+            self.balancer.release_all_tasks()
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
@@ -718,6 +783,9 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        # print(f"--->>>dynamic_pcp_size: {dynamic_pcp_size}\n"
+        #       f"--->>>dynamic_pcp_size: {dynamic_pcp_ranks}")
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -733,6 +801,8 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            dynamic_pcp_size=dynamic_pcp_size,
+            dynamic_pcp_ranks=dynamic_pcp_ranks,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1149,6 +1219,8 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             if stopped:
+                # Prefill: model结束后，设置请求的kv_transfer_params
+                request.dynamic_pcp_size = scheduler_output.dynamic_pcp_size # 将请求的KVCache存放信息（是按照CP还是DP）告诉D节点
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)

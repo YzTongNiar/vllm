@@ -36,7 +36,7 @@ class BlockHashToBlockMap:
     (i.e. {block_hash: KVCacheBlocks})
     - Mostly block_hash maps to a single KVCacheBlock, and KVCacheBlocks
         would simply be a KVCacheBlock.
-    - Otherwise, KVCacheBlocks is a dict from {block_id: KVCacheBlock}
+    - Otherwise, KVCacheBlocks is a dict from {global_block_id: KVCacheBlock}
 
     A cached block is a full block with a block hash that can be used
     for prefix caching.
@@ -81,37 +81,37 @@ class BlockHashToBlockMap:
         elif isinstance(blocks, KVCacheBlock):
             # If there's a block with the same key, merge the original block
             # and the new block into a dict
-            self._cache[key] = {blocks.block_id: blocks, block.block_id: block}
+            self._cache[key] = {blocks.global_block_id: blocks, block.global_block_id: block}
         elif isinstance(blocks, dict):
             # If it's already a dict, simply insert the block
-            blocks[block.block_id] = block
+            blocks[block.global_block_id] = block
         else:
             self._unexpected_blocks_type(blocks)
 
-    def pop(self, key: BlockHashWithGroupId, block_id: int) -> KVCacheBlock | None:
+    def pop(self, key: BlockHashWithGroupId, global_block_id: int) -> KVCacheBlock | None:
         """
-        Checks if block_hash exists and pop block_id from the cache
+        Checks if block_hash exists and pop global_block_id from the cache
         """
         blocks = self._cache.pop(key, None)
         if blocks is None:
             # block_hash not found in the cache
             return None
-        # TODO(Jialin): If key is found, block_id should always present
+        # TODO(Jialin): If key is found, global_block_id should always present
         # in blocks. We currently keep the original behaviour for safety.
         #
-        # Will add block_id == blocks.block_id assertion and
-        # use del blocks[block_id] instead as followup.
+        # Will add global_block_id == blocks.global_block_id assertion and
+        # use del blocks[global_block_id] instead as followup.
         if isinstance(blocks, KVCacheBlock):
-            if blocks.block_id == block_id:
+            if blocks.global_block_id == global_block_id:
                 return blocks
             # If the single block ID doesn't match, we should put the
             # block back (it should happen rarely)
             self._cache[key] = blocks
             return None
         if isinstance(blocks, dict):
-            # Try to pop block_id from the block dict, and if dict still
+            # Try to pop global_block_id from the block dict, and if dict still
             # contain blocks, put back to the cache.
-            block = blocks.pop(block_id, None)
+            block = blocks.pop(global_block_id, None)
             if len(blocks) > 0:
                 self._cache[key] = blocks
             return block
@@ -142,6 +142,7 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        pool_id: The id of the BlockPool.
     """
 
     def __init__(
@@ -151,14 +152,16 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        pool_id: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        print(f"======= self.num_gpu_blocks: {self.num_gpu_blocks}, pool_id: {pool_id}")
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool_id) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -179,6 +182,10 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+    def _get_global_block_id(self, block: "KVCacheBlock") -> int:
+        # global block ID: block_id + num_gpu_blocks * block_pool_id
+        return block.block_id + self.num_gpu_blocks * block.block_pool_id
+    
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -262,6 +269,7 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             blk.block_hash = block_hash_with_group_id
+            blk.global_block_id = self._get_global_block_id(blk)
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
@@ -343,7 +351,8 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
-        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
+        global_block_id = self._get_global_block_id(block)
+        if self.cached_block_hash_to_block.pop(block_hash, global_block_id) is None:
             # block not found in cached_block_hash_to_block,
             # eviction is not needed
             return False

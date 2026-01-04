@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from math import lcm
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.multi_block_pool import MultiBlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -41,18 +42,33 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_dynamic_pcp: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(
-            kv_cache_config.num_blocks,
-            enable_caching,
-            hash_block_size,
-            enable_kv_cache_events,
-            metrics_collector,
-        )
+        # self.block_pool = BlockPool(
+        #     kv_cache_config.num_blocks,
+        #     enable_caching,
+        #     hash_block_size,
+        #     enable_kv_cache_events,
+        #     metrics_collector,
+        # )
+        # TODO:静态cp目前依然用方案一，后期采用方案二，将下方enable_dynamic_pcp去掉
+        if pcp_world_size > 1 and enable_dynamic_pcp:
+            self.block_pool = MultiBlockPool(kv_cache_config.num_blocks,
+                                             enable_caching,
+                                             enable_kv_cache_events,
+                                             pcp_world_size)
+        else:
+            self.block_pool = BlockPool(
+                kv_cache_config.num_blocks,
+                enable_caching,
+                hash_block_size,
+                enable_kv_cache_events,
+                metrics_collector,
+            )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -73,6 +89,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_encoder_tokens: int,
+        pool_ids: list[int] = None
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -95,12 +112,11 @@ class KVCacheCoordinator(ABC):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id, num_encoder_tokens, []
-                )
+                    request_id, num_encoder_tokens, [],
+                    pool_ids)
             else:
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id, num_tokens, new_computed_blocks[i]
-                )
+                    request_id, num_tokens, new_computed_blocks[i], pool_ids)
         return num_blocks_to_allocate
 
     def save_new_computed_blocks(
@@ -118,8 +134,11 @@ class KVCacheCoordinator(ABC):
             manager.save_new_computed_blocks(request_id, new_computed_blocks[i])
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_encoder_tokens: int = 0
-    ) -> tuple[list[KVCacheBlock], ...]:
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_encoder_tokens: int = 0,
+        pool_ids: list[int] = None) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -130,6 +149,8 @@ class KVCacheCoordinator(ABC):
                 tokens that are already allocated).
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            pool_ids: The ids of block pool to allocate new blocks (default
+                is None if not use multi block pool and enable dynamic cp).
 
         Returns:
             The new allocated blocks.
@@ -139,7 +160,7 @@ class KVCacheCoordinator(ABC):
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
+                else num_tokens, pool_ids
             )
             for manager in self.single_type_managers
         )
@@ -232,6 +253,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_dynamic_pcp: bool = False
     ):
         super().__init__(
             kv_cache_config,
@@ -243,6 +265,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -278,6 +301,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_dynamic_pcp: bool = False
     ):
         super().__init__(
             kv_cache_config,
@@ -289,6 +313,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -296,7 +321,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self.pcp_world_size = pcp_world_size
         if dcp_world_size > 1:
             self.block_size *= dcp_world_size
-        if pcp_world_size > 1:
+        if pcp_world_size > 1 and not enable_dynamic_pcp:
             self.block_size *= pcp_world_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
@@ -346,6 +371,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_dynamic_pcp: bool = False
     ):
         super().__init__(
             kv_cache_config,
@@ -357,6 +383,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -369,6 +396,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        assert enable_dynamic_pcp == False, "dynamic PCP not support hybrid attn now"
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -533,6 +561,7 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    enable_dynamic_pcp: bool = False
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -544,6 +573,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -556,6 +586,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -567,4 +598,5 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        enable_dynamic_pcp=enable_dynamic_pcp
     )

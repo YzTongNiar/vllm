@@ -206,6 +206,12 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+    
+    # When pcp_size > 1 and enable_dynamic_pcp is True
+    dynamic_pcp_size: int = 1    # 属于 [1, pcp_size]
+    # {req_id: (pcp_rank_id, num_scheduled_tokens)}, 描述每个请求被分配到哪个pcp_rank和请求长度
+    # len(dynamic_pcp_ranks) = len(num_scheduled_tokens)
+    dynamic_pcp_ranks: dict[str, int] = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

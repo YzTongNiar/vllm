@@ -134,7 +134,7 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
-
+        self.dynamic_pcp_size: int = 1
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
     @classmethod

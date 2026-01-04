@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.multi_block_pool import MultiBlockPool
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -104,6 +105,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        enable_dynamic_pcp: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -116,6 +118,21 @@ class KVCacheManager:
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
+        self.block_size: Optional[int] = None
+        if self.enable_caching:
+            assert len(
+                set(g.kv_cache_spec.block_size
+                    for g in kv_cache_config.kv_cache_groups)
+            ) == 1, "Only one block size is supported for now"
+            self.block_size = kv_cache_config.kv_cache_groups[
+                0].kv_cache_spec.block_size
+
+            if dcp_world_size > 1:
+                assert len(kv_cache_config.kv_cache_groups) == 1
+                self.block_size *= dcp_world_size
+            if pcp_world_size > 1 and not enable_dynamic_pcp:
+                self.block_size *= pcp_world_size
+
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -126,6 +143,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            enable_dynamic_pcp=enable_dynamic_pcp,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -212,6 +230,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        pool_ids: list[int] = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -282,9 +301,14 @@ class KVCacheManager:
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
+            pool_ids=pool_ids,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        if isinstance(self.block_pool, MultiBlockPool):
+            num_free_blocks = self.block_pool.get_num_free_blocks_by_pool(pool_ids)
+        else:
+            num_free_blocks = self.block_pool.get_num_free_blocks()
+        if num_blocks_to_allocate > num_free_blocks:
             # Cannot allocate new blocks
             return None
 
@@ -304,8 +328,8 @@ class KVCacheManager:
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot, num_encoder_tokens
-        )
+            request.request_id, num_tokens_need_slot, num_encoder_tokens,
+            pool_ids)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

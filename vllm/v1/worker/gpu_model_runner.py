@@ -171,7 +171,7 @@ from .utils import (
     bind_kv_cache,
     sanity_check_mm_encoder_outputs,
 )
-
+from vllm.v1.core.sched.output import NewRequestData
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -314,8 +314,10 @@ class GPUModelRunner(
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
-        self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        
+        self.pcp_world_size = self.parallel_config.prefill_context_parallel_size
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self.max_num_tokens = scheduler_config.max_num_batched_tokens
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -612,6 +614,51 @@ class GPUModelRunner(
         if self.mm_budget:
             self.mm_budget.reset_cache()
 
+    def _generate_cached_request(self, new_req_data: NewRequestData) -> CachedRequestState:
+        req_id = new_req_data.req_id
+        sampling_params = new_req_data.sampling_params
+        pooling_params = new_req_data.pooling_params
+
+        if (
+            sampling_params
+            and sampling_params.sampling_type == SamplingType.RANDOM_SEED
+        ):
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(sampling_params.seed)
+        else:
+            generator = None
+
+        if self.is_pooling_model:
+            assert pooling_params is not None
+            task = pooling_params.task
+            assert task is not None, "You did not set `task` in the API"
+
+            model = cast(VllmModelForPooling, self.get_model())
+            to_update = model.pooler.get_pooling_updates(task)
+            to_update.apply(pooling_params)
+
+        req_state = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=new_req_data.prompt_token_ids,
+            prompt_embeds=new_req_data.prompt_embeds,
+            mm_features=new_req_data.mm_features,
+            sampling_params=sampling_params,
+            pooling_params=pooling_params,
+            generator=generator,
+            block_ids=new_req_data.block_ids,
+            num_computed_tokens=new_req_data.num_computed_tokens,
+            output_token_ids=[],
+            lora_request=new_req_data.lora_request,
+        )
+
+        if sampling_params and sampling_params.prompt_logprobs is not None:
+            self.num_prompt_logprobs[req_id] = (
+                self.input_batch.vocab_size
+                if sampling_params.prompt_logprobs == -1
+                else sampling_params.prompt_logprobs
+            )
+        return req_state
+
     @torch.inference_mode()
     def init_fp8_kv_scales(self) -> None:
         """
@@ -803,48 +850,8 @@ class GPUModelRunner(
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-            pooling_params = new_req_data.pooling_params
-
-            if (
-                sampling_params
-                and sampling_params.sampling_type == SamplingType.RANDOM_SEED
-            ):
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
-
-            if self.is_pooling_model:
-                assert pooling_params is not None
-                task = pooling_params.task
-                assert task is not None, "You did not set `task` in the API"
-
-                model = cast(VllmModelForPooling, self.get_model())
-                to_update = model.pooler.get_pooling_updates(task)
-                to_update.apply(pooling_params)
-
-            req_state = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                prompt_embeds=new_req_data.prompt_embeds,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=pooling_params,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-            )
-            self.requests[req_id] = req_state
-
-            if sampling_params and sampling_params.prompt_logprobs is not None:
-                self.num_prompt_logprobs[req_id] = (
-                    self.input_batch.vocab_size
-                    if sampling_params.prompt_logprobs == -1
-                    else sampling_params.prompt_logprobs
-                )
+            self.requests[req_id] = self._generate_cached_request(new_req_data)
+            req_state = self.requests[req_id]
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
