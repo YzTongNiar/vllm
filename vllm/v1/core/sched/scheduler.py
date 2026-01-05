@@ -446,6 +446,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         is_first_request = True
+        is_short_request = True
         dynamic_pcp_size = self.pcp_world_size
         dynamic_pcp_ranks: dict[str, int] = {}
         if not preempted_reqs:
@@ -607,10 +608,20 @@ class Scheduler(SchedulerInterface):
 
                 request.dynamic_pcp_ranks: list[int] = []
                 if self.pcp_world_size > 1 and self.enable_dynamic_pcp:
+                    request_num_new_tokens = request.num_tokens - num_computed_tokens
+                    is_short_request = request_num_new_tokens  < self.dynamic_pcp_threshold[0]
                     if is_first_request:
-                        first_request_num_new_tokens = request.num_tokens - num_computed_tokens
-                        if first_request_num_new_tokens < self.dynamic_pcp_threshold[0]:
+                        if is_short_request:
+                            is_short_batch = True
                             dynamic_pcp_size = 1
+                        else:
+                            is_short_batch = False
+                    else:
+                        if (is_short_batch and not is_short_request) or (not is_short_batch and is_short_request):
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            # print(f"===== request: {request.request_id}, skip, request_num_new_tokens: {request_num_new_tokens}")
+                            continue
  
                     # BP case
                     if dynamic_pcp_size == 1:
