@@ -144,7 +144,7 @@ class Scheduler(SchedulerInterface):
 
         # dynamic pcp
         self.enable_dynamic_pcp = True
-        self.dynamic_pcp_threshold = [128]
+        self.dynamic_pcp_threshold = [4096]
         self.dynamic_pcp_policy = (0, 0)
         self.balancer = None
         if self.pcp_world_size > 1 and self.enable_dynamic_pcp:
@@ -632,9 +632,9 @@ class Scheduler(SchedulerInterface):
                             dynamic_pcp_ranks[request.request_id] = self.balancer.dispatch_task_without_id(num_new_tokens)
                         request.dynamic_pcp_ranks.append(dynamic_pcp_ranks[request.request_id])
  
-                    print(f'>>>>>>>>> is_first_request: {is_first_request}, dynamic_pcp_size::{dynamic_pcp_size}, request_id:: {request.request_id}, '
-                          f'num_new_tokens:: {request.num_tokens - num_computed_tokens}, '
-                          f'dynamic_pcp_ranks:: {dynamic_pcp_ranks}')
+                    # print(f'>>>>>>>>> is_first_request: {is_first_request}, dynamic_pcp_size::{dynamic_pcp_size}, request_id:: {request.request_id}, '
+                    #       f'num_new_tokens:: {request.num_tokens - num_computed_tokens}, '
+                    #       f'dynamic_pcp_ranks:: {dynamic_pcp_ranks}')
                     if is_first_request:
                         is_first_request = False
                     # print(f'>>>>>>>>> dynamic_cp_size::{dynamic_cp_size}, request_id:: {request.request_id}, num_new_tokens:: {request.num_tokens - num_computed_tokens}, dynamic_cp_ranks:: {dynamic_cp_ranks}')
@@ -649,9 +649,10 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     pool_ids=request.dynamic_pcp_ranks,
                 )
+                print(f"======= schedule allocate_slots, request.dynamic_pcp_ranks: {request.dynamic_pcp_ranks}")
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
+                    del dynamic_pcp_ranks[request.request_id]
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -781,6 +782,9 @@ class Scheduler(SchedulerInterface):
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        # print(f"--->>>dynamic_pcp_size: {dynamic_pcp_size}\n"
+        #       f"--->>>dynamic_pcp_size: {dynamic_pcp_ranks}")
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

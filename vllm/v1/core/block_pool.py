@@ -156,6 +156,7 @@ class BlockPool:
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        print(f"======= self.num_gpu_blocks: {self.num_gpu_blocks}, pool_id: {pool_id}")
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.

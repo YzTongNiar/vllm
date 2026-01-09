@@ -37,6 +37,7 @@ class MultiBlockPool(BlockPool):
         super(MultiBlockPool, self).__init__(num_gpu_blocks, enable_caching,
                                              enable_kv_cache_events,
                                              pool_id=-1)
+        print(f"========= MultiBlockPool, num_gpu_blocks: {num_gpu_blocks}, self.num_pools: {self.num_pools}")
         # Change the method of BlockPool, make sure all the operations of
         # cached_block_hash_to_block & kv_event_queue will call the global obj.
         # Make sure the method is changed before create local pool.
@@ -47,7 +48,7 @@ class MultiBlockPool(BlockPool):
         for pool_id in range(self.num_pools):
             self.block_pools.append(BlockPool(num_gpu_blocks, enable_caching,
                                               enable_kv_cache_events,
-                                              pool_id))
+                                              pool_id=pool_id))
  
     def get_cached_block(
             self, block_hash: BlockHash,
