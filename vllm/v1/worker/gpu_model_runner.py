@@ -542,7 +542,7 @@ class GPUModelRunner(
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
         self.arange_np = np.arange(
-            max(self.max_num_reqs + 1, self.max_model_len, self.max_num_tokens),
+            max(self.max_num_reqs + 1, self.max_model_len * 2, self.max_num_tokens),
             dtype=np.int64,
         )
 
@@ -1135,6 +1135,7 @@ class GPUModelRunner(
         # Equivalent to but faster than:
         # np.concatenate([np.arange(n) for n in num_tokens])
         """
+        # print(f"====>num_tokens:{num_tokens}")
         # Step 1. [2, 5, 3] -> [2, 7, 10]
         cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
         total_num_tokens = cu_num_tokens[-1]
