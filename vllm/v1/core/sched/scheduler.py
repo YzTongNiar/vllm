@@ -333,7 +333,7 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
-
+            # print(f"=========== decode request: {request.request_id}, num_new_tokens: {num_new_tokens}, request.num_tokens_with_spec: {request.num_tokens_with_spec}, request.num_output_placeholders: {request.num_output_placeholders}, request.num_computed_tokens: {request.num_computed_tokens}")
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -637,7 +637,7 @@ class Scheduler(SchedulerInterface):
                     #       f'dynamic_pcp_ranks:: {dynamic_pcp_ranks}')
                     if is_first_request:
                         is_first_request = False
-                    # print(f'>>>>>>>>> dynamic_cp_size::{dynamic_cp_size}, request_id:: {request.request_id}, num_new_tokens:: {request.num_tokens - num_computed_tokens}, dynamic_cp_ranks:: {dynamic_cp_ranks}')
+                    # print(f'>>>>>>>>> dynamic_cp_size::{dynamic_pcp_size}, request_id:: {request.request_id}, num_new_tokens:: {request.num_tokens - num_computed_tokens}, dynamic_pcp_ranks:: {dynamic_pcp_ranks}')
                 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -649,10 +649,10 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     pool_ids=request.dynamic_pcp_ranks,
                 )
-                print(f"======= schedule allocate_slots, request.dynamic_pcp_ranks: {request.dynamic_pcp_ranks}")
+                # print(f"======= schedule prefill , request: {request.request_id}, num_new_tokens: {num_new_tokens}, num_external_computed_tokens: {num_external_computed_tokens}")
 
                 if new_blocks is None:
-                    del dynamic_pcp_ranks[request.request_id]
+                    # del dynamic_pcp_ranks[request.request_id]
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -783,8 +783,17 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        # print(f"--->>>dynamic_pcp_size: {dynamic_pcp_size}\n"
-        #       f"--->>>dynamic_pcp_size: {dynamic_pcp_ranks}")
+        # print(
+        #     f"--->>>dynamic_pcp_size: {dynamic_pcp_size}\n"
+        #     f"--->>>dynamic_pcp_ranks: {dynamic_pcp_ranks}\n"
+        #     f"--->>>num_scheduled_tokens len: {len(num_scheduled_tokens)}\n"
+        #     f"--->>>num_scheduled_tokens: {num_scheduled_tokens}"
+        # )
+
+        # print(
+        #     f"--->>>new_reqs_data len: {len(new_reqs_data)}\n"
+        #     f"--->>>waiting len: {len(self.waiting)}\n"
+        # )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

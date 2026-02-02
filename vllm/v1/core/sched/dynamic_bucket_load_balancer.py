@@ -187,8 +187,8 @@ class DynamicBucketLoadBalancer:
             if self.base_probability_threshold < best_redirect_prob:
                 final_bucket_idx = best_neighbor_idx
                 self.redirected_tasks += 1
-                self._log_info(f"{cur_task} redirected from bucket {standard_bucket_idx} to {final_bucket_idx}"
-                               f"(prob={best_redirect_prob:.4f})")
+                # self._log_info(f"{cur_task} redirected from bucket {standard_bucket_idx} to {final_bucket_idx}"
+                #                f"(prob={best_redirect_prob:.4f})")
 
         # 将任务分配给最终选定的桶（更新统计信息）
         self.buckets[final_bucket_idx].task_count += 1

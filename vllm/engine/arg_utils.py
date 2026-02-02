@@ -1924,6 +1924,9 @@ class EngineArgs:
                 "disabling it for V1 backend."
             )
             self.enable_prefix_caching = False
+            
+        self.enable_chunked_prefill = False
+        self.enable_prefix_caching = False
 
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,
